@@ -1,0 +1,244 @@
+
+
+    // ==UserScript==
+    // @name         Tappytoon Chapter Downloader
+    // @namespace    http://tampermonkey.net/
+    // @version      1.0
+    // @description  Downloads chapter images individually from Tappytoon in proper order.
+    // @author       ozler365
+    // @license      MIT
+    // @match        https://www.tappytoon.com/*
+    // @grant        GM_xmlhttpRequest
+    // @grant        GM_download
+    // @run-at       document-start
+    // ==/UserScript==
+     
+    (function() {
+        'use strict';
+     
+        let capturedChapterData = null;
+        let downloadBtn = null;
+        let isDownloading = false;
+     
+        // --- Extract Episode ID from URL ---
+        function getEpisodeIdFromUrl() {
+            // Tappytoon URL example: https://www.tappytoon.com/en/chapters/296076087
+            const match = window.location.pathname.match(/\/chapters\/(\d+)/);
+            return match ? match[1] : null;
+        }
+     
+        // --- Data Interception ---
+     
+        function findChapterData(obj, url) {
+            if (!obj || typeof obj !== 'object') return null;
+     
+            const episodeId = getEpisodeIdFromUrl();
+            
+            // Ensure we are looking at the request for the current episode
+            // User noted the XHR filename includes the ID, e.g., manifest?chapterId=296076087
+            if (episodeId && url && !url.includes(episodeId)) {
+                return null;
+            }
+     
+            // Tappytoon JSON structure: { files: [ { sortKey: 1, url: "..." }, ... ] }
+            if (obj.files && Array.isArray(obj.files)) {
+                // Filter and map the files to our internal format
+                const validFiles = obj.files.filter(f => f.url && f.sortKey !== undefined);
+     
+                if (validFiles.length > 0) {
+                    // Sort by sortKey to ensure correct reading order
+                    const sortedImages = [...validFiles].sort((a, b) => a.sortKey - b.sortKey);
+     
+                    return {
+                        images: sortedImages.map(f => ({
+                            ord: f.sortKey,
+                            downloadUrl: f.url
+                        })),
+                        title: document.title || `Chapter ${episodeId}`,
+                        episodeId: episodeId
+                    };
+                }
+            }
+     
+            return null;
+        }
+     
+        // Hook into XMLHttpRequest
+        const originalOpen = XMLHttpRequest.prototype.open;
+        XMLHttpRequest.prototype.open = function(method, url) {
+            this.addEventListener('load', function() {
+                try {
+                    // Tappytoon API responses are JSON
+                    const res = JSON.parse(this.responseText);
+                    const found = findChapterData(res, typeof url === 'string' ? url : url.toString());
+     
+                    if (found && found.images.length > 0) {
+                        capturedChapterData = found;
+                        console.log('[Tappytoon Downloader] Chapter data captured via XHR:', found);
+                        updateButtonState();
+                    }
+                } catch (e) {
+                    // Ignore errors (non-JSON responses)
+                }
+            });
+            originalOpen.apply(this, arguments);
+        };
+     
+        // Hook into Fetch API (Backup interception)
+        const originalFetch = window.fetch;
+        window.fetch = async (...args) => {
+            const response = await originalFetch(...args);
+            try {
+                const url = typeof args[0] === 'string' ? args[0] : args[0].url;
+                const clone = response.clone();
+                clone.json().then(data => {
+                    const found = findChapterData(data, url);
+                    if (found && found.images.length > 0) {
+                        capturedChapterData = found;
+                        console.log('[Tappytoon Downloader] Chapter data captured via Fetch:', found);
+                        updateButtonState();
+                    }
+                }).catch(() => {});
+            } catch (e) {}
+            return response;
+        };
+     
+        // --- UI Construction ---
+     
+        function createButton() {
+            if (document.getElementById('tappy-dl-btn')) return;
+     
+            downloadBtn = document.createElement('button');
+            downloadBtn.id = 'tappy-dl-btn';
+            downloadBtn.innerText = 'Download Chapter';
+            downloadBtn.style.position = 'fixed';
+            downloadBtn.style.bottom = '20px';
+            downloadBtn.style.right = '20px';
+            downloadBtn.style.zIndex = '9999';
+            downloadBtn.style.padding = '10px 20px';
+            downloadBtn.style.backgroundColor = '#5c5c5c';
+            downloadBtn.style.color = '#ffffff';
+            downloadBtn.style.border = 'none';
+            downloadBtn.style.borderRadius = '5px';
+            downloadBtn.style.cursor = 'not-allowed';
+            downloadBtn.style.fontWeight = 'bold';
+            downloadBtn.style.boxShadow = '0 4px 6px rgba(0,0,0,0.1)';
+            downloadBtn.disabled = true;
+     
+            downloadBtn.onclick = startDownload;
+     
+            document.body.appendChild(downloadBtn);
+        }
+     
+        function updateButtonState() {
+            if (!downloadBtn) createButton();
+     
+            if (capturedChapterData && !isDownloading) {
+                downloadBtn.style.backgroundColor = '#ec407a'; // Tappytoon pink
+                downloadBtn.style.cursor = 'pointer';
+                const count = capturedChapterData.images.length;
+                downloadBtn.innerText = `Download: ${count} pages`;
+                downloadBtn.disabled = false;
+            }
+        }
+     
+        // --- Download Logic ---
+     
+        function startDownload() {
+            if (!capturedChapterData || isDownloading) return;
+     
+            isDownloading = true;
+            const images = capturedChapterData.images;
+            // Sanitize title for folder name
+            const folderName = sanitizeFilename(capturedChapterData.title).trim();
+     
+            downloadBtn.innerText = `Downloading 0/${images.length}...`;
+            downloadBtn.disabled = true;
+            downloadBtn.style.backgroundColor = '#ff6600';
+     
+            let completed = 0;
+            let failed = 0;
+            let currentIndex = 0;
+     
+            function downloadNext() {
+                if (currentIndex >= images.length) {
+                    isDownloading = false;
+                    downloadBtn.style.backgroundColor = '#00cc00';
+                    downloadBtn.innerText = `✓ Done ${completed}/${images.length}`;
+                    downloadBtn.disabled = false;
+                    
+                    setTimeout(() => {
+                        updateButtonState();
+                    }, 3000);
+                    return;
+                }
+     
+                const imgData = images[currentIndex];
+                const url = imgData.downloadUrl;
+                // Determine extension (default to jpg)
+                const ext = url.split('.').pop().split('?')[0] || 'jpg';
+                // Use 'ord' (sortKey) if available, otherwise index
+                const pageNum = imgData.ord || (currentIndex + 1);
+                const filename = `${String(pageNum).padStart(3, '0')}.${ext}`;
+                const fullPath = `${folderName}/${filename}`;
+     
+                GM_download({
+                    url: url,
+                    name: fullPath,
+                    onload: function() {
+                        completed++;
+                        currentIndex++;
+                        downloadBtn.innerText = `Downloading ${currentIndex}/${images.length}...`;
+                        // Small delay to prevent rate limiting
+                        setTimeout(downloadNext, 100);
+                    },
+                    onerror: function() {
+                        failed++;
+                        currentIndex++;
+                        downloadBtn.innerText = `Downloading ${currentIndex}/${images.length}...`;
+                        setTimeout(downloadNext, 100);
+                    },
+                    ontimeout: function() {
+                        failed++;
+                        currentIndex++;
+                        downloadBtn.innerText = `Downloading ${currentIndex}/${images.length}...`;
+                        setTimeout(downloadNext, 100);
+                    }
+                });
+            }
+     
+            downloadNext();
+        }
+     
+        function sanitizeFilename(name) {
+            return name.replace(/[<>:"/\\|?*]/g, "").replace(/\s+/g, " ").trim().substring(0, 100);
+        }
+     
+        // --- Initialize ---
+     
+        if (document.readyState === 'loading') {
+            document.addEventListener('DOMContentLoaded', createButton);
+        } else {
+            createButton();
+        }
+        window.addEventListener('load', createButton);
+     
+        // Reset state on URL change (Single Page App navigation)
+        let lastUrl = location.href;
+        new MutationObserver(() => {
+            const url = location.href;
+            if (url !== lastUrl) {
+                lastUrl = url;
+                capturedChapterData = null;
+                isDownloading = false;
+                if (downloadBtn) {
+                    downloadBtn.style.backgroundColor = '#5c5c5c';
+                    downloadBtn.style.cursor = 'not-allowed';
+                    downloadBtn.innerText = 'Download Chapter';
+                    downloadBtn.disabled = true;
+                }
+            }
+        }).observe(document, {subtree: true, childList: true});
+     
+    })();
+
