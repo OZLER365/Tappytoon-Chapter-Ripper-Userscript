@@ -6,7 +6,7 @@
     // @version      1.0
     // @description  Downloads chapter images individually from Tappytoon in proper order.
     // @author       ozler365
-    // @license      MIT
+    // @license      GPL-3.0-only
     // @match        https://www.tappytoon.com/*
     // @grant        GM_xmlhttpRequest
     // @grant        GM_download
